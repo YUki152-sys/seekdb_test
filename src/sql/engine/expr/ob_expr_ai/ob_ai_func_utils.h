@@ -324,6 +324,8 @@ public:
                                 const share::ObAiModelEndpointInfo &endpoint_info,
                                 ObJsonObject *http_response,
                                 ObIJsonBase *&result);
+  static int parse_indexed_embeddings(ObIAllocator &allocator, ObJsonArray *embeddings,
+                                      const ObString &index_key, ObIJsonBase *&result);
   static int parse_rerank_output(ObIAllocator &allocator, 
                                  const share::ObAiModelEndpointInfo &endpoint_info,
                                  ObJsonObject *http_response,
