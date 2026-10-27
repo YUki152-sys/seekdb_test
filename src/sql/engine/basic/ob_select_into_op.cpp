@@ -38,7 +38,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, copy_options_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -53,14 +53,18 @@ int ObSelectIntoOp::inner_open()
     if (OB_FAIL(session->get_sql_select_limit(top_limit_cnt_))) {
     }
   }
-  if (OB_SUCC(ret) && !MY_SPEC.external_properties_.str_.empty()) {
+  if (OB_SUCC(ret) && !MY_SPEC.copy_options_.empty()) {
+    OZ(copy_def_.decode(MY_SPEC.copy_options_));
+    OZ(copy_writer_.open(copy_def_, *session));
+  }
+  if (OB_SUCC(ret) && MY_SPEC.copy_options_.empty() && !MY_SPEC.external_properties_.str_.empty()) {
     if (OB_FAIL(external_properties_.load_from_string(MY_SPEC.external_properties_.str_,
                                                       ctx_.get_allocator()))) {
     } else {
       format_type_ = external_properties_.format_type_;
     }
   }
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && MY_SPEC.copy_options_.empty()) {
     switch (format_type_)
     {
       case ObExternalFileFormat::FormatType::CSV_FORMAT:
@@ -186,50 +190,137 @@ int ObSelectIntoOp::calc_outfile_path()
   }
   return ret;
 }
+int ObSelectIntoOp::write_copy_row()
+{
+  int ret = OB_SUCCESS;
+  ObEvalCtx::TempAllocGuard allocator_guard(eval_ctx_);
+  ObArenaAllocator &allocator = allocator_guard.get_allocator();
+  ObSEArray<ObObj, 16> values;
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.select_exprs_.count(); ++i) {
+    ObExpr *expr = MY_SPEC.select_exprs_.at(i);
+    ObDatum *datum = nullptr; ObObj value;
+    OZ(expr->eval(eval_ctx_, datum));
+    if (OB_SUCC(ret)) { OZ(datum->to_obj(value, expr->obj_meta_)); }
+    if (OB_SUCC(ret) && !value.is_null() && (value.is_lob_storage() || value.is_json())) {
+      ObTextStringIter iter(expr->datum_meta_.type_, expr->datum_meta_.cs_type_, datum->get_string(),
+                            expr->obj_meta_.has_lob_header());
+      ObStringBuffer text(&allocator);
+      ObString block;
+      ObTextStringIterState state = TEXTSTRING_ITER_NEXT;
+      OZ(ObTextStringHelper::build_text_iter(iter, eval_ctx_.exec_ctx_, &allocator));
+      while (OB_SUCC(ret) && (state = iter.get_next_block(block)) == TEXTSTRING_ITER_NEXT) {
+        if (text.length() + block.length() > (8L << 20)) { ret = OB_SIZE_OVERFLOW; }
+        else { OZ(text.append(block)); }
+      }
+      if (OB_SUCC(ret) && state != TEXTSTRING_ITER_NEXT && state != TEXTSTRING_ITER_END) {
+        ret = iter.get_inner_ret() != OB_SUCCESS ? iter.get_inner_ret() : OB_INVALID_DATA;
+      }
+      if (OB_SUCC(ret) && value.is_json()) {
+        ObIJsonBase *json = nullptr;
+        ObJsonBuffer output(&allocator);
+        OZ(ObJsonBaseFactory::get_json_base(&allocator, text.string(), ObJsonInType::JSON_BIN,
+                                           ObJsonInType::JSON_BIN, json));
+        if (OB_SUCC(ret)) { OZ(json->print(output, true)); }
+        text.reuse();
+        OZ(text.append(output.ptr(), output.length()));
+      }
+      if (OB_SUCC(ret)) { value.set_varchar(text.string()); }
+    }
+    OZ(values.push_back(value));
+  }
+  OZ(copy_writer_.write_row(values));
+  return ret;
+}
+
+int ObSelectIntoOp::copy_next_row()
+{
+  int ret = OB_SUCCESS;
+  int64_t rows = 0;
+  while (OB_SUCC(ret) && rows < top_limit_cnt_) {
+    clear_evaluated_flag();
+    if (OB_FAIL(child_->get_next_row())) {}
+    else { OZ(write_copy_row()); ++rows; }
+  }
+  if (ret == OB_ITER_END || OB_SUCC(ret)) {
+    ret = copy_writer_.finish();
+    if (OB_SUCC(ret)) { ctx_.get_physical_plan_ctx()->set_affected_rows(rows); ret = OB_ITER_END; }
+  }
+  if (OB_FAIL(ret) && ret != OB_ITER_END) { copy_writer_.abort(); }
+  return ret;
+}
+
+int ObSelectIntoOp::copy_next_batch(int64_t max_row_cnt)
+{
+  int ret = OB_SUCCESS;
+  int64_t rows = 0;
+  bool done = false;
+  while (OB_SUCC(ret) && !done && rows < top_limit_cnt_) {
+    const ObBatchRows *batch = nullptr;
+    clear_evaluated_flag();
+    OZ(child_->get_next_batch(MIN(max_row_cnt, top_limit_cnt_ - rows), batch));
+    if (OB_SUCC(ret)) {
+      ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
+      guard.set_batch_size(batch->size_);
+      for (int64_t i = 0; OB_SUCC(ret) && i < batch->size_; ++i) {
+        if (!batch->skip_->contain(i)) { guard.set_batch_idx(i); OZ(write_copy_row()); ++rows; }
+      }
+      done = batch->end_;
+    }
+  }
+  OZ(copy_writer_.finish());
+  if (OB_SUCC(ret)) { ctx_.get_physical_plan_ctx()->set_affected_rows(rows); brs_.size_ = 0; brs_.end_ = true; }
+  else { copy_writer_.abort(); }
+  return ret;
+}
+
 int ObSelectIntoOp::inner_get_next_row()
 {
   int ret = 0 == top_limit_cnt_ ? OB_ITER_END : OB_SUCCESS;
-  int64_t row_count = 0;
-  const ObItemType into_type = MY_SPEC.into_type_;
-  ObPhysicalPlanCtx *phy_plan_ctx = NULL;
-  ObExternalFileWriter *data_writer = NULL;
-  if (OB_ISNULL(phy_plan_ctx = ctx_.get_physical_plan_ctx())) {
-    ret = OB_ERR_UNEXPECTED;
-  }
-  if (OB_SUCC(ret) && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_
-      && T_INTO_VARIABLES != into_type
-      && OB_FAIL(create_the_only_data_writer(data_writer))) {
-  }
-  while (OB_SUCC(ret) && row_count < top_limit_cnt_) {
-    clear_evaluated_flag();
-    if (OB_FAIL(child_->get_next_row())) {
-      if (OB_LIKELY(OB_ITER_END == ret)) {
-      } else {
-      }
-    } else {
-      ++row_count;
-      if (T_INTO_VARIABLES == into_type) {
-        if (OB_FAIL(into_varlist())) {
-        }
-      } else if (T_INTO_OUTFILE == into_type) {
-        if (OB_FAIL(into_outfile(data_writer))) {
+  if (!MY_SPEC.copy_options_.empty()) {
+    ret = copy_next_row();
+  } else {
+    int64_t row_count = 0;
+    const ObItemType into_type = MY_SPEC.into_type_;
+    ObPhysicalPlanCtx *phy_plan_ctx = NULL;
+    ObExternalFileWriter *data_writer = NULL;
+    if (OB_ISNULL(phy_plan_ctx = ctx_.get_physical_plan_ctx())) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+    if (OB_SUCC(ret) && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_
+        && T_INTO_VARIABLES != into_type
+        && OB_FAIL(create_the_only_data_writer(data_writer))) {
+    }
+    while (OB_SUCC(ret) && row_count < top_limit_cnt_) {
+      clear_evaluated_flag();
+      if (OB_FAIL(child_->get_next_row())) {
+        if (OB_LIKELY(OB_ITER_END == ret)) {
+        } else {
         }
       } else {
-        if (OB_FAIL(into_dumpfile(data_writer))) {
+        ++row_count;
+        if (T_INTO_VARIABLES == into_type) {
+          if (OB_FAIL(into_varlist())) {
+          }
+        } else if (T_INTO_OUTFILE == into_type) {
+          if (OB_FAIL(into_outfile(data_writer))) {
+          }
+        } else {
+          if (OB_FAIL(into_dumpfile(data_writer))) {
+          }
         }
       }
-    }
-    if (OB_SUCC(ret) || OB_ITER_END == ret) { // if into user variables or into dumpfile, must be one row
-      if ((T_INTO_VARIABLES == into_type || T_INTO_DUMPFILE == into_type) && row_count > 1) {
-        ret = OB_ERR_TOO_MANY_ROWS;
+      if (OB_SUCC(ret) || OB_ITER_END == ret) { // if into user variables or into dumpfile, must be one row
+        if ((T_INTO_VARIABLES == into_type || T_INTO_DUMPFILE == into_type) && row_count > 1) {
+          ret = OB_ERR_TOO_MANY_ROWS;
+        }
       }
+    } //end while
+    if (OB_ITER_END == ret || OB_SUCC(ret)) { // set affected rows
+      phy_plan_ctx->set_affected_rows(row_count);
     }
-  } //end while
-  if (OB_ITER_END == ret || OB_SUCC(ret)) { // set affected rows
-    phy_plan_ctx->set_affected_rows(row_count);
-  }
-  if (OB_FAIL(ret) && OB_ITER_END != ret) {
-    need_commit_ = false;
+    if (OB_FAIL(ret) && OB_ITER_END != ret) {
+      need_commit_ = false;
+    }
   }
   return ret;
 }
@@ -237,81 +328,85 @@ int ObSelectIntoOp::inner_get_next_row()
 int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  const ObBatchRows *child_brs = NULL;
-  int64_t batch_size = min(max_row_cnt, MY_SPEC.max_batch_size_);
-  int64_t row_count = 0;
-  const ObItemType into_type = MY_SPEC.into_type_;
-  ObPhysicalPlanCtx *phy_plan_ctx = NULL;
-  ObExternalFileWriter *data_writer = NULL;
-  bool stop_loop = false;
-  bool is_iter_end = false;
-  if (OB_ISNULL(phy_plan_ctx = ctx_.get_physical_plan_ctx())) {
-    ret = OB_ERR_UNEXPECTED;
-  }
-  if (OB_SUCC(ret) && T_INTO_VARIABLES != into_type
-      && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_) {
-    if (OB_FAIL(create_the_only_data_writer(data_writer))) {
-    } else if (OB_ISNULL(data_writer)) {
+  if (!MY_SPEC.copy_options_.empty()) {
+    ret = copy_next_batch(max_row_cnt);
+  } else {
+    const ObBatchRows *child_brs = NULL;
+    int64_t batch_size = min(max_row_cnt, MY_SPEC.max_batch_size_);
+    int64_t row_count = 0;
+    const ObItemType into_type = MY_SPEC.into_type_;
+    ObPhysicalPlanCtx *phy_plan_ctx = NULL;
+    ObExternalFileWriter *data_writer = NULL;
+    bool stop_loop = false;
+    bool is_iter_end = false;
+    if (OB_ISNULL(phy_plan_ctx = ctx_.get_physical_plan_ctx())) {
       ret = OB_ERR_UNEXPECTED;
     }
-  }
+    if (OB_SUCC(ret) && T_INTO_VARIABLES != into_type
+        && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_) {
+      if (OB_FAIL(create_the_only_data_writer(data_writer))) {
+      } else if (OB_ISNULL(data_writer)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    }
 
-  if (0 == top_limit_cnt_) {
-    brs_.size_ = 0;
-    brs_.end_ = true;
-    stop_loop = true;
-  }
-  while (OB_SUCC(ret) && !stop_loop) {
-    clear_evaluated_flag();
-    int64_t rowkey_batch_size = min(batch_size, top_limit_cnt_ - row_count);
-    if (OB_FAIL(child_->get_next_batch(rowkey_batch_size, child_brs))) {
-    } else {
-      brs_.size_ = child_brs->size_;
-      brs_.end_ = child_brs->end_;
-      is_iter_end = brs_.end_ && 0 == brs_.size_;
-      if (brs_.size_ > 0) {
-        brs_.skip_->deep_copy(*(child_brs->skip_), brs_.size_);
-        row_count += brs_.size_ - brs_.skip_->accumulate_bit_cnt(brs_.size_);
-        if (T_INTO_OUTFILE == into_type) {
-          if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_) {
-            if (OB_FAIL(into_outfile_batch_csv(brs_, data_writer))) {
-            }
-          } else {
-            ret = OB_NOT_SUPPORTED;
-          }
-        } else {
-          ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
-          guard.set_batch_size(brs_.size_);
-          for (int64_t i = 0; OB_SUCC(ret) && i < brs_.size_; i++) {
-            if (brs_.skip_->contain(i)) {
-              continue;
-            }
-            guard.set_batch_idx(i);
-            if (T_INTO_VARIABLES == into_type) {
-              if (OB_FAIL(into_varlist())) {
+    if (0 == top_limit_cnt_) {
+      brs_.size_ = 0;
+      brs_.end_ = true;
+      stop_loop = true;
+    }
+    while (OB_SUCC(ret) && !stop_loop) {
+      clear_evaluated_flag();
+      int64_t rowkey_batch_size = min(batch_size, top_limit_cnt_ - row_count);
+      if (OB_FAIL(child_->get_next_batch(rowkey_batch_size, child_brs))) {
+      } else {
+        brs_.size_ = child_brs->size_;
+        brs_.end_ = child_brs->end_;
+        is_iter_end = brs_.end_ && 0 == brs_.size_;
+        if (brs_.size_ > 0) {
+          brs_.skip_->deep_copy(*(child_brs->skip_), brs_.size_);
+          row_count += brs_.size_ - brs_.skip_->accumulate_bit_cnt(brs_.size_);
+          if (T_INTO_OUTFILE == into_type) {
+            if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_) {
+              if (OB_FAIL(into_outfile_batch_csv(brs_, data_writer))) {
               }
             } else {
-              if (OB_FAIL(into_dumpfile(data_writer))) {
+              ret = OB_NOT_SUPPORTED;
+            }
+          } else {
+            ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
+            guard.set_batch_size(brs_.size_);
+            for (int64_t i = 0; OB_SUCC(ret) && i < brs_.size_; i++) {
+              if (brs_.skip_->contain(i)) {
+                continue;
+              }
+              guard.set_batch_idx(i);
+              if (T_INTO_VARIABLES == into_type) {
+                if (OB_FAIL(into_varlist())) {
+                }
+              } else {
+                if (OB_FAIL(into_dumpfile(data_writer))) {
+                }
               }
             }
           }
         }
       }
-    }
-    if (is_iter_end || row_count >= top_limit_cnt_) {
-      stop_loop = true;
-    }
-    if (OB_SUCC(ret) || is_iter_end) { // if into user variables or into dumpfile, must be one row
-      if ((T_INTO_VARIABLES == into_type || T_INTO_DUMPFILE == into_type) && row_count > 1) {
-        ret = OB_ERR_TOO_MANY_ROWS;
+      if (is_iter_end || row_count >= top_limit_cnt_) {
+        stop_loop = true;
       }
+      if (OB_SUCC(ret) || is_iter_end) { // if into user variables or into dumpfile, must be one row
+        if ((T_INTO_VARIABLES == into_type || T_INTO_DUMPFILE == into_type) && row_count > 1) {
+          ret = OB_ERR_TOO_MANY_ROWS;
+        }
+      }
+    } //end while
+    if (OB_SUCC(ret)) { // set affected rows
+      phy_plan_ctx->set_affected_rows(row_count);
     }
-  } //end while
-  if (OB_SUCC(ret)) { // set affected rows
-    phy_plan_ctx->set_affected_rows(row_count);
-  }
-  if (OB_FAIL(ret)) {
-    need_commit_ = false;
+    if (OB_FAIL(ret)) {
+      need_commit_ = false;
+    }
   }
   return ret;
 }
@@ -324,6 +419,7 @@ int ObSelectIntoOp::inner_rescan()
 
 int ObSelectIntoOp::inner_close()
 {
+  copy_writer_.abort();
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
   }
@@ -1275,6 +1371,10 @@ int ObSelectIntoOp::new_data_writer(ObExternalFileWriter *&data_writer)
 
 void ObSelectIntoOp::destroy()
 {
+  copy_writer_.abort();
+  copy_def_.columns_.reset();
+  copy_def_.described_columns_.reset();
+  copy_def_.discovered_paths_.reset();
   if (OB_NOT_NULL(data_writer_)) {
     data_writer_->~ObExternalFileWriter();
   }

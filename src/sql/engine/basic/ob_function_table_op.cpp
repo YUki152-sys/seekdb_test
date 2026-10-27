@@ -27,15 +27,25 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_,
+                    file_table_, file_column_indices_);
 
 int ObFunctionTableOp::inner_open()
 {
   int ret = OB_SUCCESS;
   node_idx_ = 0;
   already_calc_ = false;
+  file_batch_ = nullptr;
+  file_batch_index_ = 0;
   if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (MY_SPEC.file_table_) {
+    ObDatum *value = nullptr;
+    next_row_func_ = &ObFunctionTableOp::inner_get_next_row_file;
+    OZ(MY_SPEC.value_expr_->eval(eval_ctx_, value));
+    if (OB_SUCC(ret)) { OZ(file_def_.decode(value->get_string())); }
+    OZ(file_reader_.open(file_def_, *ctx_.get_my_session()));
+    OZ(file_reader_.project(MY_SPEC.file_column_indices_));
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -47,7 +57,13 @@ int ObFunctionTableOp::inner_open()
 int ObFunctionTableOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ObOperator::inner_rescan())) {
+  if (MY_SPEC.file_table_) {
+    file_batch_ = nullptr;
+    file_batch_index_ = 0;
+    ret = file_reader_.rescan();
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObOperator::inner_rescan())) {
   } else {
     node_idx_ = 0;
     if (MY_SPEC.has_correlated_expr_) {
@@ -67,11 +83,16 @@ int ObFunctionTableOp::inner_close()
   row_count_ = 0;
   col_count_ = 0;
   value_table_ = NULL;
+  file_reader_.close();
   return ret;
 }
 
 void ObFunctionTableOp::destroy()
 {
+  file_reader_.close();
+  file_def_.columns_.reset();
+  file_def_.described_columns_.reset();
+  file_def_.discovered_paths_.reset();
   ObOperator::destroy();
 }
 
@@ -102,6 +123,54 @@ int ObFunctionTableOp::get_current_result(ObObj &result)
 int ObFunctionTableOp::inner_get_next_row()
 {
   return (this->*next_row_func_)();
+}
+
+int ObFunctionTableOp::inner_get_next_row_file()
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  OZ(ctx_.check_status());
+  OZ(file_reader_.check_identity());
+  if (OB_SUCC(ret) && (file_batch_ == nullptr || file_batch_index_ >= file_batch_->count())) {
+    OZ(file_reader_.next_batch(file_batch_));
+    file_batch_index_ = 0;
+  }
+  const FileRecord *record = OB_SUCC(ret) ? file_batch_->at(file_batch_index_++) : nullptr;
+  if (OB_SUCC(ret)) {
+    const ObIArray<FileCell> &cells = record->cells_;
+    const ObIArray<ObString> &names = record->names_;
+    if (OB_SUCC(ret) && !file_def_.describe_ && file_def_.format_ == FileScanDef::CSV && cells.count() != file_def_.columns_.count()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "file SQL CSV column count mismatch");
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+      int64_t index = MY_SPEC.file_column_indices_.at(i);
+      const FileColumn &column = file_def_.columns_.at(index);
+      FileCell missing; missing.null_ = true;
+      const FileCell *cell = &missing;
+      if (file_def_.describe_ || file_def_.format_ != FileScanDef::JSONL) { cell = &cells.at(index); }
+      else {
+        for (int64_t j = 0; j < names.count(); ++j) {
+          if (names.at(j).case_compare(column.name_) == 0) { cell = &cells.at(j); }
+        }
+      }
+      ObObj object;
+      OZ(FileScanUtils::convert(*cell, column, object));
+      ObExpr *expr = MY_SPEC.column_exprs_.at(i);
+      ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+      if (OB_SUCC(ret)) { OZ(datum.from_obj(object)); }
+      if (OB_SUCC(ret) && !object.is_null() && object.is_string_type()) {
+        char *memory = expr->get_str_res_mem(eval_ctx_, cell->text_.length());
+        if (memory == nullptr && !cell->text_.empty()) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+        else {
+          if (!cell->text_.empty()) { MEMCPY(memory, cell->text_.ptr(), cell->text_.length()); }
+          datum.set_string(memory, cell->text_.length());
+        }
+      }
+      if (OB_SUCC(ret)) { expr->get_eval_info(eval_ctx_).evaluated_ = true; }
+    }
+  }
+  return ret;
 }
 
 int ObFunctionTableOp::inner_get_next_row_udf()

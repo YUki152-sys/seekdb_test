@@ -160,6 +160,8 @@ public:
   {
     return is_overwrite_;
   }
+  void set_copy_options(const common::ObString &value) { copy_options_ = value; }
+  const common::ObString &get_copy_options() const { return copy_options_; }
   inline common::ObString get_external_properties() const
   {
     return external_properties_;
@@ -188,6 +190,7 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  common::ObString copy_options_;
 };
 }
 }

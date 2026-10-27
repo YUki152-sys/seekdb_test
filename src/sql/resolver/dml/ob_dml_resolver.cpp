@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "ob_dml_resolver.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
@@ -3923,6 +3924,53 @@ int ObDMLResolver::resolve_json_table_item(const ParseNode &parse_tree, TableIte
   return ret;
 }
 
+int ObDMLResolver::resolve_file_table_expr(const ParseNode &node, ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  FileScanDef def;
+  ObString encoded;
+  ObConstRawExpr *constant = nullptr;
+  OZ(def.parse(node, *session_info_, *allocator_));
+  OZ(def.infer(*session_info_, *allocator_));
+  OZ(def.encode(*allocator_, encoded));
+  OZ(ObRawExprUtils::build_const_string_expr(*params_.expr_factory_, ObVarcharType,
+                                           encoded, CS_TYPE_BINARY, constant));
+  if (OB_SUCC(ret)) {
+    OZ(constant->formalize(session_info_));
+    expr = constant;
+    stmt_->get_query_ctx()->disable_udf_parallel_ = true;
+    stmt_->get_query_ctx()->get_query_hint_for_update().get_global_hint().merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_table_columns(const TableItem &table_item, ObIArray<ColumnItem> &col_items)
+{
+  int ret = OB_SUCCESS;
+  FileScanDef def;
+  const ObConstRawExpr *expr = static_cast<const ObConstRawExpr *>(table_item.function_table_expr_);
+  OZ(def.decode(expr->get_value().get_string()));
+  for (int64_t i = 0; OB_SUCC(ret) && i < def.columns_.count(); ++i) {
+    const FileColumn &column = def.columns_.at(i);
+    ColumnItem *item = get_stmt()->get_column_item(table_item.table_id_, column.name_);
+    if (item == nullptr) {
+      ObObjMeta meta; meta.set_type(FileScanUtils::obj_type(column.type_));
+      if (meta.is_string_type()) {
+        meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+        meta.set_collation_level(CS_LEVEL_IMPLICIT);
+      }
+      ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[meta.get_type()];
+      if (meta.is_string_type()) { accuracy.set_length(MAX(1, column.max_length_)); }
+      if (column.type_ == FileColumn::DATETIME) { accuracy.set_scale(column.scale_); }
+      OZ(resolve_function_table_column_item(table_item, meta, accuracy, column.name_,
+                                           OB_APP_MIN_COLUMN_ID + i, item));
+      if (OB_SUCC(ret)) { if (!column.nullable_) { item->expr_->set_result_flag(NOT_NULL_FLAG); } }
+    }
+    if (OB_SUCC(ret)) { OZ(col_items.push_back(*item)); }
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
                                                TableItem *&tbl_item)
 {
@@ -3940,7 +3988,12 @@ int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
   }
   if (OB_SUCC(ret)) {
     OX (params_.is_resolve_table_function_expr_ = true);
-    OZ (resolve_sql_expr(*(parse_tree.children_[0]), function_table_expr));
+    if (parse_tree.children_[0]->type_ == T_FUN_SYS
+        && (parse_tree.children_[0]->value_ == 1 || parse_tree.children_[0]->value_ == 2)) {
+      OZ(resolve_file_table_expr(*parse_tree.children_[0], function_table_expr));
+    } else {
+      OZ (resolve_sql_expr(*(parse_tree.children_[0]), function_table_expr));
+    }
     OX (params_.is_resolve_table_function_expr_ = false);
     CK (OB_NOT_NULL(function_table_expr));
     OX (alias_node = parse_tree.children_[1]);
@@ -7475,7 +7528,9 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_item.function_table_expr_));
   if (OB_SUCC(ret)) {
-    if (table_item.function_table_expr_->get_result_type().is_ext()) {
+    if (table_item.function_table_expr_->is_const_raw_expr()) {
+      ret = resolve_file_table_columns(table_item, col_items);
+    } else if (table_item.function_table_expr_->get_result_type().is_ext()) {
       ret = resolve_function_table_column_item_udf(table_item, col_items);
     } else {
       ret = resolve_function_table_column_item_sys_func(table_item, col_items);

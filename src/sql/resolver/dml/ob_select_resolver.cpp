@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/dml/ob_del_upd_resolver.h"
 #include "share/ob_time_utility2.h"
@@ -3081,6 +3082,38 @@ int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
   return ret;
 }
 
+int ObSelectResolver::resolve_copy_file(const ParseNode &node, ObSelectIntoItem &into)
+{
+  int ret = OB_SUCCESS;
+  FileScanDef def;
+  ParseNode name = {};
+  name.type_ = T_IDENT; name.str_value_ = "read_csv"; name.str_len_ = 8;
+  ParseNode args = {}; args.type_ = T_EXPR_LIST;
+  ObSEArray<ParseNode *, 8> children;
+  OZ(children.push_back(node.children_[0]));
+  if (node.children_[1] != nullptr) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < node.children_[1]->num_child_; ++i) {
+      OZ(children.push_back(node.children_[1]->children_[i]));
+    }
+  }
+  args.children_ = children.get_data(); args.num_child_ = children.count();
+  ParseNode function = {}; ParseNode *parts[] = {&name, &args};
+  function.type_ = T_FUN_SYS; function.children_ = parts; function.num_child_ = 2;
+  OZ(def.parse(function, *session_info_, *allocator_));
+  for (int64_t i = 0; OB_SUCC(ret) && i < get_select_stmt()->get_select_item_size(); ++i) {
+    const SelectItem &item = get_select_stmt()->get_select_item(i);
+    OZ(def.add_column(item.alias_name_, *allocator_));
+  }
+  OZ(def.encode(*allocator_, into.copy_options_));
+  if (OB_SUCC(ret)) {
+    into.outfile_name_.set_varchar(def.path_);
+    into.is_single_ = true;
+    get_select_stmt()->get_query_ctx()->disable_udf_parallel_ = true;
+    get_select_stmt()->get_query_ctx()->get_query_hint_for_update().get_global_hint().merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_clause(const ParseNode *node)
 {
   int ret = OB_SUCCESS;
@@ -3105,7 +3138,9 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
       new(into_item) ObSelectIntoItem();
       into_item->into_type_ = node->type_;
       if (T_INTO_OUTFILE == node->type_) { // into outfile
-        if (is_in_set_query()) {
+        if (node->value_ == 1 && node->num_child_ == 2) {
+          ret = resolve_copy_file(*node, *into_item);
+        } else if (is_in_set_query()) {
           ret = OB_INAPPROPRIATE_INTO;
         } else if (node->num_child_ == 3 && NULL != node->children_[1]
             && T_EXTERNAL_FILE_FORMAT == node->children_[1]->type_) { // Handle with `FORMAT`

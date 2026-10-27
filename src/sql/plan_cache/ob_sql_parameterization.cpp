@@ -292,6 +292,13 @@ bool ObSqlParameterization::is_tree_not_param(const ParseNode *tree)
     ret_bool = true;
   } else if (true == tree->is_tree_not_param_) {
     ret_bool = true;
+  } else if (T_INTO_OUTFILE == tree->type_ && tree->value_ == 1) {
+    ret_bool = true;
+  } else if (T_TABLE_COLLECTION_EXPRESSION == tree->type_ && tree->num_child_ == 2
+      && tree->children_[0] != nullptr && tree->children_[0]->type_ == T_FUN_SYS
+      && (tree->children_[0]->value_ == 1 || tree->children_[0]->value_ == 2)) {
+    // File table paths and options determine column names and types at resolve time.
+    ret_bool = true;
   } else if (T_GROUPBY_CLAUSE == tree->type_) {
     // select a from t group by 1 enables group by parameterization
     ret_bool = true;

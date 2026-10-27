@@ -18,6 +18,7 @@
 #define SRC_SQL_ENGINE_BASIC_OB_SELECT_INTO_OP_H_
 
 #include "sql/engine/ob_operator.h"
+#include "sql/engine/basic/ob_file_copy_writer.h"
 #include "lib/file/ob_file.h"
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/engine/basic/ob_select_into_basic.h"
@@ -75,6 +76,7 @@ public:
   {
   }
 
+  common::ObString copy_options_;
   ObItemType into_type_;
   common::ObFixedArray<common::ObString, common::ObIAllocator> user_vars_;
   common::ObObj outfile_name_;
@@ -195,6 +197,12 @@ public:
   virtual void destroy() override;
 
 private:
+  int copy_next_row();
+  int copy_next_batch(int64_t max_row_cnt);
+  int write_copy_row();
+  FileScanDef copy_def_;
+  FileCopyWriter copy_writer_;
+
   int init_env_common();
   int init_csv_env();
   void set_csv_format_options();
